@@ -5,3 +5,7 @@ Depth sweep file — keeps h=640, z=384 (run_005 optimal dims) fixed and varies 
 
 
 ACDC file : best v7 version on ACDC dataset 
+
+v8_dataflow_model and train:  Model implementation of reasoning (reasoner w/o cross attention)
+
+train_dataflow : model implementation with and w/o cross attention 
