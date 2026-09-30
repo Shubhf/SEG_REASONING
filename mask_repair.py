@@ -52,6 +52,23 @@ forward+backward passes through repair_model per training step, not free.
 Run:
   K_UNROLL=3 CUDA_VISIBLE_DEVICES=<idx> PYTHONUNBUFFERED=1 \
   nohup python mask_repair.py > logs/mask_repair_crossattn_unrolled.log 2>&1 &
+
+
+  plain K, exactly as before, no monotonic loss:
+  python3 -m py_compile mask_repair.py && echo "SYNTAX OK"
+
+EPOCHS=200 SEED=42 K_UNROLL=3 MAX_SEVERITY=0.3 SELF_GEN_FRACTION=0.5 ADAPTIVE_BLEND=0 \
+CUDA_VISIBLE_DEVICES=1 PYTHONUNBUFFERED=1 \
+python mask_repair.py 2>&1 | tee logs/k3_s42_baseline.log
+
+
+K with the new monotonic loss term turned on, to actually test it:
+python3 -m py_compile mask_repair.py && echo "SYNTAX OK"
+
+MONOTONIC_LOSS_WEIGHT=0.1 EPOCHS=200 SEED=42 K_UNROLL=3 MAX_SEVERITY=0.3 SELF_GEN_FRACTION=0.5 ADAPTIVE_BLEND=0 \
+CUDA_VISIBLE_DEVICES=1 PYTHONUNBUFFERED=1 \
+python mask_repair.py 2>&1 | tee logs/k3_s42_monotonic.log
+
 """
 
 import os, sys, glob, re, json, math, time
