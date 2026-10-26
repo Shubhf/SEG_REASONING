@@ -1,0 +1,151 @@
+diff --git a/train/block_loss.py b/train/block_loss.py
+new file mode 100644
+index 0000000..1296ae8
+--- /dev/null
++++ b/train/block_loss.py
+@@ -0,0 +1,35 @@
++import torch
++import torch.nn.functional as F
++
++
++def _info_nce(q, p, target, temperature):
++    scores = torch.matmul(F.normalize(q, p=2, dim=-1), F.normalize(p, p=2, dim=-1).transpose(0, 1)) / temperature
++    return F.cross_entropy(scores.view(q.size(0), -1), target)
++
++
++def cross_corr_penalty(prev, new, eps=1e-6):
++    """Mean squared cross-correlation between columns of `prev` [N, d1] and `new` [N, d2]."""
++    prev = prev.float()
++    new = new.float()
++    prev = (prev - prev.mean(0, keepdim=True)) / (prev.std(0, keepdim=True) + eps)
++    new = (new - new.mean(0, keepdim=True)) / (new.std(0, keepdim=True) + eps)
++    with torch.amp.autocast('cuda', enabled=False):  # keep the correlation matmul in fp32
++        corr = torch.matmul(prev.transpose(0, 1), new) / prev.size(0)  # [d1, d2]
++    return corr.pow(2).mean()
++
++
++def block_extra_losses(q_proj, p_proj, dims, weights, temperature, target, block_coef, orth_lambda):
++    """Returns (extra_loss, block_loss_detached, orth_loss_detached). dims descending."""
++    zero = q_proj.new_zeros((), dtype=torch.float32)
++    l_block, l_orth = zero, zero
++    feats = torch.cat([q_proj, p_proj], dim=0) if orth_lambda > 0 else None
++    for i in range(len(dims) - 1):
++        lo, hi = dims[i + 1], dims[i]
++        if block_coef > 0:
++            l_block = l_block + weights[i] * _info_nce(
++                q_proj[:, lo:hi], p_proj[:, lo:hi], target, temperature
++            )
++        if orth_lambda > 0:
++            l_orth = l_orth + cross_corr_penalty(feats[:, :lo], feats[:, lo:hi])
++    extra = block_coef * l_block + orth_lambda * l_orth
++    return extra, l_block.detach(), l_orth.detach()
+diff --git a/train/block_loss_selftest.py b/train/block_loss_selftest.py
+new file mode 100644
+index 0000000..e94e343
+--- /dev/null
++++ b/train/block_loss_selftest.py
+@@ -0,0 +1,28 @@
++import torch
++from .block_loss import block_extra_losses, cross_corr_penalty
++
++torch.manual_seed(0)
++N = 4096
++prev = torch.randn(N, 8); ind = torch.randn(N, 8); dup = prev.clone()
++p_ind, p_dup = cross_corr_penalty(prev, ind).item(), cross_corr_penalty(prev, dup).item()
++print(f"orth penalty independent={p_ind:.5f} duplicate={p_dup:.5f} (expect ~0 and ~0.125)")
++assert p_ind < 0.01 and abs(p_dup - 0.125) < 0.02
++
++D, B, G = 32, 6, 8
++dims, weights = [32, 16, 8, 4, 2], [1.0, 0.3, 0.2, 0.1, 0.1]
++q = torch.randn(B, D, requires_grad=True); p = torch.randn(B * G, D, requires_grad=True)
++target = torch.arange(B) * G
++extra, lb, lo = block_extra_losses(q, p, dims, weights, 0.01, target, 1.0, 0.1)
++extra.backward()
++print(f"extra={extra.item():.4f} block={lb.item():.4f} orth={lo.item():.4f}")
++assert torch.isfinite(extra) and q.grad.abs().sum() > 0 and p.grad.abs().sum() > 0
++
++e0, _, _ = block_extra_losses(torch.randn(B, D), torch.randn(B * G, D), dims, weights, 0.01, target, 0.0, 0.0)
++assert e0.item() == 0.0
++
++q3 = torch.randn(B, D, requires_grad=True); p3 = torch.randn(B * G, D, requires_grad=True)
++e, _, _ = block_extra_losses(q3, p3, dims, weights, 0.01, target, 1.0, 0.0)
++e.backward()
++assert q3.grad[:, : dims[-1]].abs().sum() == 0, "base prefix must not get block-loss gradient"
++assert q3.grad[:, dims[-1]:].abs().sum() > 0
++print("ALL OK")
+diff --git a/train/modeling.py b/train/modeling.py
+index 01f4f0e..8cf5191 100644
+--- a/train/modeling.py
++++ b/train/modeling.py
+@@ -11,6 +11,8 @@ import torch.distributed as dist
+ from torch import Tensor, nn
+ from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, AutoConfig
+ 
++from .block_loss import block_extra_losses
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -40,6 +42,11 @@ class BiEncoderModel(nn.Module):
+ 
+         self.cross_entropy = nn.CrossEntropyLoss(reduction='mean')
+ 
++        # Optional block-wise predictive loss / cross-orthogonality regulariser (default OFF = baseline).
++        self.block_coef = float(os.environ.get('BLOCK_COEF', '0'))
++        self.orth_lambda = float(os.environ.get('ORTH_LAMBDA', '0'))
++        print(f'[block_loss] BLOCK_COEF={self.block_coef} ORTH_LAMBDA={self.orth_lambda}', flush=True)
++
+         self.query_instruction_for_retrieval = query_instruction_for_retrieval
+         self.passage_instruction_for_retrieval = passage_instruction_for_retrieval
+ 
+@@ -142,6 +149,12 @@ class BiEncoderModel(nn.Module):
+             loss_NCE += self.weights[i] * self.compute_loss(scores_part, target)
+ 
+         self._last_loss_dict = {'loss_NCE': loss_NCE.detach().item()}
++        if self.block_coef > 0 or self.orth_lambda > 0:
++            loss_extra, l_block, l_orth = block_extra_losses(
++                q_reps_proj, p_reps_proj, self.dims, self.weights, self.temperature,
++                target, self.block_coef, self.orth_lambda)
++            self._last_loss_dict.update({'loss_block': l_block.item(), 'loss_orth': l_orth.item()})
++            loss_NCE = loss_NCE + loss_extra
+ 
+         return loss_NCE
+ 
+diff --git a/train/modeling_rawMRL.py b/train/modeling_rawMRL.py
+index 8be5f66..97518d1 100644
+--- a/train/modeling_rawMRL.py
++++ b/train/modeling_rawMRL.py
+@@ -11,6 +11,8 @@ import torch.distributed as dist
+ from torch import Tensor, nn
+ from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, AutoConfig
+ 
++from .block_loss import block_extra_losses
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -33,6 +35,11 @@ class BiEncoderModel(nn.Module):
+ 
+         self.cross_entropy = nn.CrossEntropyLoss(reduction='mean')
+ 
++        # Optional block-wise predictive loss / cross-orthogonality regulariser (default OFF = baseline).
++        self.block_coef = float(os.environ.get('BLOCK_COEF', '0'))
++        self.orth_lambda = float(os.environ.get('ORTH_LAMBDA', '0'))
++        print(f'[block_loss] BLOCK_COEF={self.block_coef} ORTH_LAMBDA={self.orth_lambda}', flush=True)
++
+         self.query_instruction_for_retrieval = query_instruction_for_retrieval
+         self.passage_instruction_for_retrieval = passage_instruction_for_retrieval
+ 
+@@ -131,6 +138,12 @@ class BiEncoderModel(nn.Module):
+             loss_NCE += self.weights[i] * self.compute_loss(scores_part, target)
+ 
+         self._last_loss_dict = {'loss_NCE': loss_NCE.detach().item()}
++        if self.block_coef > 0 or self.orth_lambda > 0:
++            loss_extra, l_block, l_orth = block_extra_losses(
++                q_reps, p_reps, self.dims, self.weights, self.temperature,
++                target, self.block_coef, self.orth_lambda)
++            self._last_loss_dict.update({'loss_block': l_block.item(), 'loss_orth': l_orth.item()})
++            loss_NCE = loss_NCE + loss_extra
+ 
+         return loss_NCE
+ 
